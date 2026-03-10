@@ -1,33 +1,44 @@
 """
-train.py – Build and persist the TF-IDF + Logistic-Regression classifier.
+train.py – Build and persist the Sentence-Transformer + Logistic-Regression
+           category classifier AND a matching severity classifier.
+
+Pre-trained backbone: sentence-transformers/all-MiniLM-L6-v2
+  - Distilled BERT model pre-trained on 1B+ sentence pairs
+  - Produces 384-dimensional semantic embeddings that capture MEANING,
+    not just keyword overlap – a genuine NLP approach vs plain TF-IDF.
 
 Run once:  python train.py
 
 Data sources (in priority order):
-  1. Mydata/no_pii_grievance.json  – PGPORTAL grievance dataset (175k records)
-  2. Hand-crafted seed examples below (always included for balance)
+  1. Mydata/processed_dataset.csv  – clean PGPORTAL grievances (175k records)
+  2. Mydata/no_pii_grievance.json  – fallback raw JSON
 """
 
 import json
 import os
 import random
 import re
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import joblib
 import nltk
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from nltk.tokenize import word_tokenize
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
 
 nltk.download("stopwords", quiet=True)
 nltk.download("punkt", quiet=True)
 nltk.download("wordnet", quiet=True)
+
+# ── Pre-trained sentence encoder (all-MiniLM-L6-v2) ──────────────────────────
+# Loaded once here so both category and severity training share the same encoder.
+print("Loading pre-trained sentence encoder: all-MiniLM-L6-v2 …")
+from sentence_transformers import SentenceTransformer
+_ENCODER = SentenceTransformer("all-MiniLM-L6-v2")
+print("Encoder ready – embedding dimension:", _ENCODER.get_sentence_embedding_dimension())
 
 # ---------------------------------------------------------------------------
 # Dataset paths
@@ -255,13 +266,111 @@ def load_dataset_examples() -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 # Hand-crafted seed corpus
 # All categories are now sufficiently covered by Mydata/no_pii_grievance.json.
-# Seeds are kept empty — remove this list if Mydata extraction proves sufficient.
 # ---------------------------------------------------------------------------
 TRAINING_DATA = []
 
+# ---------------------------------------------------------------------------
+# Severity labeling – silver labels used to train the severity classifier
+# These keyword sets are deliberately comprehensive so the ML model can learn
+# broader patterns and generalise far beyond simple keyword lookup.
+# ---------------------------------------------------------------------------
+_HIGH_SEVERITY_KW = {
+    "accident", "death", "died", "dead", "emergency", "critical", "dangerous",
+    "fire", "flood", "riot", "violence", "urgent", "murder", "rape", "attack",
+    "collapse", "derail", "explosion", "poisoning", "casualty", "injured",
+    "fatal", "severe", "bleeding", "unconscious", "bomb", "life threatening",
+    "electrocuted", "electric shock", "gas leak", "toxic", "blast", "stampede",
+    "tornado", "cyclone", "earthquake", "tsunami", "kidnap", "abduct",
+    "missing child", "dead body", "suicide", "attempted suicide",
+    "epidemic", "outbreak", "hospital fire", "bridge collapse", "road collapse",
+    "drowning", "drown", "hit and run", "mob attack", "lynching", "arson",
+    "building collapse", "structural failure", "chemical spill", "snakebite",
+    "mass casualty", "rabies", "human trafficking", "acid attack", "gang rape",
+    "threatening", "threat to life", "gun", "gunshot", "stab", "knife attack",
+    "terror", "bomb threat", "hostage", "live wire down", "high tension wire",
+    "harmful gas", "radiation leak", "contaminated drinking water",
+}
+
+_MEDIUM_SEVERITY_KW = {
+    "broken", "damaged", "not working", "problem", "issue", "complaint",
+    "delayed", "overcharge", "harassment", "theft", "missing", "shortage",
+    "corruption", "bribe", "dirty", "contaminated", "stopped", "abuse",
+    "pothole", "no electricity", "power cut", "water shortage", "no water",
+    "garbage", "stench", "foul smell", "open drain", "sewage", "leakage",
+    "crack", "encroachment", "unauthorized", "street light not working",
+    "dark road", "illegal construction", "noise pollution", "delayed response",
+    "no action taken", "bribe demand", "pending work", "overflowing", "clog",
+    "dilapidated", "drunk driver", "rash driving", "salary not paid",
+    "teacher absent", "doctor absent", "medicine shortage", "fake medicine",
+    "road blocked", "road damage", "road repair needed", "signal not working",
+    "water pipeline broken", "electric wire hanging", "transformer fault",
+    "mid-day meal", "school toilet", "dustbin overflow", "drain blocked",
+    "manhole open", "dead animal", "mosquito breeding", "waterlogging",
+    "smoke pollution", "dust pollution", "misappropriation", "embezzlement",
+    "irregular supply", "no action", "bribe demanded", "school building",
+    "hospital negligence", "wrong billing", "fake certificate", "pending repair",
+    "auto rickshaw overcharge", "unlicensed vehicle", "no bus", "no train",
+    "delayed salary", "cheated", "fraud", "forged document", "illegal mining",
+    "deforestation", "illegal dumping", "untreated sewage", "toxic waste",
+}
+
+
+def _severity_label(text: str) -> str:
+    """Assign a silver severity label to a training text using domain keywords."""
+    tl = text.lower()
+    for kw in _HIGH_SEVERITY_KW:
+        if kw in tl:
+            return "High"
+    for kw in _MEDIUM_SEVERITY_KW:
+        if kw in tl:
+            return "Medium"
+    return "Low"
+
+
+def train_severity_model(texts: list):
+    """
+    Train a dedicated sentence-embedding + Logistic-Regression severity
+    classifier using silver labels derived from domain keyword rules.
+    The model learns semantic patterns far beyond simple keyword lookup.
+    Saved to models/severity_classifier.joblib.
+    """
+    print("\n" + "=" * 60)
+    print("Step 6 – Training severity classifier (embedding-based) …")
+
+    labels = [_severity_label(t) for t in texts]
+    counts = Counter(labels)
+    print(f"  Label distribution → {dict(counts)}")
+
+    print(f"  Encoding {len(texts):,} texts with all-MiniLM-L6-v2 …")
+    embeddings = _ENCODER.encode(texts, batch_size=64, show_progress_bar=True,
+                                  convert_to_numpy=True)
+
+    use_stratify = all(v >= 2 for v in counts.values()) and len(counts) >= 2
+    sX_train, sX_test, sy_train, sy_test = train_test_split(
+        embeddings, labels, test_size=0.15, random_state=42,
+        stratify=labels if use_stratify else None,
+    )
+    print(f"  Train: {len(sX_train)}  |  Test: {len(sX_test)}")
+
+    clf = LogisticRegression(
+        max_iter=1000, C=2.0, solver="lbfgs",
+        multi_class="multinomial", class_weight="balanced",
+    )
+    clf.fit(sX_train, sy_train)
+    sy_pred = clf.predict(sX_test)
+    print("\n  Severity Classification Report:")
+    print(classification_report(sy_test, sy_pred))
+
+    sev_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "models", "severity_classifier.joblib"
+    )
+    joblib.dump(clf, sev_path)
+    print(f"  Severity model saved → {sev_path}")
+    return clf
+
 
 # ---------------------------------------------------------------------------
-# Helper
+# Helper (kept for any legacy callers; not used by train_model any more)
 # ---------------------------------------------------------------------------
 _lemmatizer = WordNetLemmatizer()
 _stop_words = set(stopwords.words("english"))
@@ -280,9 +389,26 @@ def preprocess(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Train
+# Train – Sentence-Transformer embedding + Logistic Regression
 # ---------------------------------------------------------------------------
 def train_model():
+    """
+    Full training pipeline using pre-trained all-MiniLM-L6-v2 embeddings.
+
+    Architecture:
+        Input text
+          → all-MiniLM-L6-v2 (pre-trained sentence encoder, frozen)
+          → 384-dim semantic embedding vector
+          → LogisticRegression classifier (multinomial, class_weight=balanced)
+          → predicted category label
+
+    Why this is better than TF-IDF:
+      - Understands MEANING: 'pothole' ≈ 'road damage' ≈ 'broken road' in
+        embedding space, even without exact keyword overlap.
+      - Handles paraphrasing, partial text, and informal Indian-English.
+      - Pre-trained on 1B+ sentence pairs so zero-shot quality is high
+        even with a small training set.
+    """
     print("=" * 60)
     print("Step 1 – Loading dataset examples …")
     dataset_examples = load_dataset_examples()
@@ -296,66 +422,55 @@ def train_model():
     texts  = [item[0] for item in all_data]
     labels = [item[1] for item in all_data]
 
-    print("\nStep 3 – Preprocessing text …")
-    processed = [preprocess(t) for t in texts]
+    # ── Step 3 – Encode texts with pre-trained sentence transformer ──────
+    print(f"\nStep 3 – Encoding {len(texts):,} texts with all-MiniLM-L6-v2 …")
+    print("  (This uses a BERT-based model pre-trained on 1B+ sentence pairs)")
+    embeddings = _ENCODER.encode(
+        texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True
+    )
+    print(f"  Embedding matrix shape: {embeddings.shape}")   # (N, 384)
 
-    # Use stratify only when every class has ≥2 samples
-    from collections import Counter
     label_counts = Counter(labels)
     min_count = min(label_counts.values())
     stratify = labels if min_count >= 2 else None
 
     X_train, X_test, y_train, y_test = train_test_split(
-        processed, labels, test_size=0.15, random_state=42, stratify=stratify
+        embeddings, labels, test_size=0.15, random_state=42, stratify=stratify
     )
     print(f"  Train: {len(X_train)}  |  Test: {len(X_test)}")
 
-    pipeline = Pipeline(
-        [
-            (
-                "tfidf",
-                TfidfVectorizer(
-                    ngram_range=(1, 3),
-                    max_features=15000,
-                    min_df=1,
-                    sublinear_tf=True,
-                    analyzer="word",
-                ),
-            ),
-            (
-                "clf",
-                LogisticRegression(
-                    max_iter=2000,
-                    C=5.0,
-                    solver="lbfgs",
-                    multi_class="multinomial",
-                    class_weight="balanced",
-                ),
-            ),
-        ]
+    # ── Step 4 – Train classifier on top of embeddings ───────────────────
+    print("\nStep 4 – Training LogisticRegression on sentence embeddings …")
+    clf = LogisticRegression(
+        max_iter=2000,
+        C=5.0,
+        solver="lbfgs",
+        multi_class="multinomial",
+        class_weight="balanced",
     )
+    clf.fit(X_train, y_train)
 
-    print("\nStep 4 – Training classifier …")
-    pipeline.fit(X_train, y_train)
-
-    y_pred = pipeline.predict(X_test)
-    print("\nClassification Report:")
+    y_pred = clf.predict(X_test)
+    print("\nCategory Classification Report:")
     print(classification_report(y_test, y_pred))
 
     os.makedirs("models", exist_ok=True)
     model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "classifier.joblib")
-    joblib.dump(pipeline, model_path)
-    print(f"\nModel saved → {model_path}")
+    joblib.dump(clf, model_path)
+    print(f"\nCategory model saved → {model_path}")
 
     # ── Step 5 – Train Word2Vec embeddings on the same corpus ────────────
     try:
         from nlp_operations import Word2VecModel
         print("\nStep 5 – Training Word2Vec embeddings …")
-        Word2VecModel.train(texts)   # `texts` = raw (unprocessed) text list from Step 2
+        Word2VecModel.train(texts)
     except ImportError:
         print("\nStep 5 – Skipped (gensim not installed). Run: pip install gensim")
 
-    return pipeline
+    # ── Step 6 – Train dedicated severity classifier ──────────────────────
+    train_severity_model(texts)
+
+    return clf
 
 
 if __name__ == "__main__":

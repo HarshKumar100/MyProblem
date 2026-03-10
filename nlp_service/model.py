@@ -1,11 +1,17 @@
 """
 model.py – ProblemClassifier and DuplicateDetector.
+
+Pre-trained backbone: sentence-transformers/all-MiniLM-L6-v2
+  Fine-tuned on the PGPORTAL grievance corpus (when available).
+  Category and severity classifiers operate on 384-dim BERT sentence
+  embeddings.
 """
 
 import os
 import re
 
 import joblib
+import numpy as np
 import nltk
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
@@ -16,6 +22,27 @@ nltk.download("punkt", quiet=True)
 nltk.download("wordnet", quiet=True)
 
 from nlp_operations import TextPreprocessor, POSTagger, Word2VecModel
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_FINETUNED_DIR = os.path.join(_THIS_DIR, "models", "finetuned-minilm")
+
+# ── Shared sentence encoder (loaded once, reused everywhere) ─────────────────
+_ENCODER = None
+
+def _get_encoder():
+    """Load the fine-tuned encoder if available, else fall back to the base model."""
+    global _ENCODER
+    if _ENCODER is None:
+        from sentence_transformers import SentenceTransformer
+        if os.path.isdir(_FINETUNED_DIR):
+            print(f"[Encoder] Loading FINE-TUNED model from {_FINETUNED_DIR} …")
+            _ENCODER = SentenceTransformer(_FINETUNED_DIR)
+        else:
+            print("[Encoder] Loading base all-MiniLM-L6-v2 (not fine-tuned) …")
+            _ENCODER = SentenceTransformer("all-MiniLM-L6-v2")
+        print("[Encoder] Ready – dim:", _ENCODER.get_sentence_embedding_dimension())
+    return _ENCODER
 
 # ---------------------------------------------------------------------------
 # Mappings
@@ -52,11 +79,12 @@ MEDIUM_KEYWORDS = {
 # ---------------------------------------------------------------------------
 class ProblemClassifier:
     def __init__(self):
-        self._lemmatizer = WordNetLemmatizer()
-        self._stop_words = set(stopwords.words("english"))
         self._preprocessor = TextPreprocessor(pos_filter=False)
         self._pos_tagger   = POSTagger()
-        self.pipeline = self._load_or_train()
+        self._encoder      = _get_encoder()
+        self.clf           = self._load_or_train()
+        self._severity_clf = self._load_severity_model()
+        self._label_encoder = self._load_label_encoder()
 
     def _load_or_train(self):
         path = "models/classifier.joblib"
@@ -67,11 +95,34 @@ class ProblemClassifier:
         from train import train_model
         return train_model()
 
-    def _preprocess(self, text: str) -> str:
-        # Delegates to TextPreprocessor from nlp_operations.py
-        return self._preprocessor.preprocess(text)
+    def _load_label_encoder(self):
+        path = os.path.join(_THIS_DIR, "models", "label_encoder.joblib")
+        if os.path.exists(path):
+            print("[LabelEncoder] Loaded – maps numeric IDs back to category names.")
+            return joblib.load(path)
+        return None
+
+    def _load_severity_model(self):
+        path = "models/severity_classifier.joblib"
+        if os.path.exists(path):
+            print("[Severity] Loading pre-trained severity model …")
+            return joblib.load(path)
+        print("[Severity] No severity model found – will use keyword fallback.")
+        return None
+
+    def _embed(self, text: str) -> np.ndarray:
+        """Encode a single text into a 384-dim sentence embedding."""
+        return self._encoder.encode([text], convert_to_numpy=True)[0]
 
     def _severity(self, text: str) -> str:
+        """Predict severity using the trained ML model; keyword fallback if unavailable."""
+        if self._severity_clf is not None:
+            try:
+                emb = self._embed(text).reshape(1, -1)
+                return self._severity_clf.predict(emb)[0]
+            except Exception:
+                pass
+        # ── Keyword fallback ───────────────────────────────────────────────
         tl = text.lower()
         for kw in HIGH_KEYWORDS:
             if kw in tl:
@@ -82,15 +133,22 @@ class ProblemClassifier:
         return "Low"
 
     def _keywords(self, text: str) -> list:
-        processed = self._preprocess(text)
+        """
+        Extract top keywords using NLTK POS filtering + frequency.
+        Returns up to 6 meaningful content words (nouns, verbs, adjectives).
+        """
         noise = {
             "road", "broken", "water", "house", "work", "near", "area",
             "people", "issue", "problem", "day", "time", "help", "need",
             "place", "local", "state", "government", "official", "year",
             "month", "coming", "going", "last", "many", "much",
         }
-        words = [w for w in processed.split() if len(w) > 3 and w not in noise]
-        return list(dict.fromkeys(words))[:6]  # deduplicated, max 6
+        try:
+            processed = self._preprocessor.preprocess(text)
+            words = [w for w in processed.split() if len(w) > 3 and w not in noise]
+            return list(dict.fromkeys(words))[:6]
+        except Exception:
+            return []
 
     def predict(self, text: str) -> dict:
         if not text or len(text.strip()) < 5:
@@ -101,18 +159,23 @@ class ProblemClassifier:
                 "keywords": [],
                 "confidence": 0.0,
             }
-        processed = self._preprocess(text)
-        category = self.pipeline.predict([processed])[0]
-        proba = self.pipeline.predict_proba([processed])[0]
+        # Encode with pre-trained sentence transformer
+        emb = self._embed(text).reshape(1, -1)
+        category   = self.clf.predict(emb)[0]
+        proba      = self.clf.predict_proba(emb)[0]
         confidence = float(max(proba))
-        agency = CATEGORY_AGENCY_MAP.get(category, "General Administration")
+        # Decode numeric label back to category name
+        if self._label_encoder is not None:
+            category = self._label_encoder.inverse_transform([category])[0]
+        else:
+            category = str(category)
+        agency     = CATEGORY_AGENCY_MAP.get(category, "General Administration")
         return {
             "category":   category,
             "agency":     agency,
             "severity":   self._severity(text),
             "keywords":   self._keywords(text),
             "confidence": round(confidence, 3),
-            # POS Tagging: top 8 tokens with their part-of-speech labels
             "pos_tags":   self._pos_tagger.tag_summary(text)["tags"][:8],
         }
 
@@ -122,8 +185,8 @@ class ProblemClassifier:
 # ---------------------------------------------------------------------------
 class DuplicateDetector:
     def __init__(self):
-        self.encoder = self._load_encoder()
-        # Word2Vec model for corpus-native semantic similarity
+        # Reuse the shared encoder (already loaded by Classifier)
+        self.encoder = _get_encoder()
         self.w2v = Word2VecModel()
 
     def _load_encoder(self):
@@ -154,9 +217,10 @@ class DuplicateDetector:
         best_id = None
 
         if self.encoder:
-            # Sentence-transformers: high-quality cross-lingual embeddings
+            # Sentence-transformers: high-quality cross-lingual BERT embeddings
             texts = [new_text] + [e["text"] for e in existing]
-            embeddings = self.encoder.encode(texts, batch_size=64, show_progress_bar=False)
+            embeddings = self.encoder.encode(texts, batch_size=64, show_progress_bar=False,
+                                             convert_to_numpy=True)
             from scipy.spatial.distance import cosine as cos_dist
             new_emb = embeddings[0]
             for i, item in enumerate(existing):
