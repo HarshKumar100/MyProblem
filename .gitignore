@@ -1,0 +1,64 @@
+# ── Node (client + server) ───────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# ── Build output ──────────────────────────────────────────────────────────────
+client/dist/
+client/.vite/
+
+# ── Environment variables ─────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+server/.env
+
+# ── Uploads (user-submitted files) ───────────────────────────────────────────
+server/uploads/*
+!server/uploads/.gitkeep
+
+# ── Python (nlp_service) ─────────────────────────────────────────────────────
+nlp_service/.venv/
+nlp_service/venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ── Trained model artifacts ───────────────────────────────────────────────────
+# Uncomment the lines below if models are too large for Git (use Git LFS instead)
+# nlp_service/models/classifier.joblib
+# nlp_service/models/word2vec.model
+# nlp_service/models/word2vec.model.wv.vectors.npy
+
+# ── OS / editor noise ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.vscode/settings.json
+.idea/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Data folder (large training data, not for VCS) ───────────────────────────
+Mydata/
+
+# ── Miscellaneous ─────────────────────────────────────────────────────────────
+*.tgz
+*.zip
+coverage/
+.nyc_output/
